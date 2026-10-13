@@ -23,11 +23,15 @@ export type CliFlag =
   | { name: string; kind: "int"; max?: number }     // e.g. --limit (max omitted => unbounded)
   | { name: string; kind: "string" }                // e.g. --text, --cursor, --query, --date
   | { name: string; kind: "bool" }                  // e.g. --unconfirmed, --clear-alarm, --context
-  | { name: string; kind: "boolString" };           // e.g. --confirmed, --completed (true|false)
+  | { name: string; kind: "boolString" }            // e.g. --confirmed, --completed (true|false)
+  | { name: string; kind: "stringList" };           // repeatable, e.g. --photo a.jpg --photo b.png -> string[]
 
 export type CliPositional = {
   name: string;
   required: boolean;
+  // "id" (default): a required positional is parsed as a positive integer.
+  // "string": kept as the given string (e.g. a thread uuid).
+  kind?: "id" | "string";
   // Human label for the "<label> must be a positive integer." parse error
   // (e.g. "Photo id"). Defaults to a capitalized `name`.
   label?: string;

@@ -88,6 +88,13 @@ function parseArgv(args: readonly string[], cli: CliSurface, _resourceName: stri
         // a positive integer". The MCP layer clamps the max (numberArg), so the CLI
         // does not enforce flag.max here.
         bag[key] = parseLenientInt(value, flag.name);
+      } else if (flag.kind === "stringList") {
+        // Repeatable: each occurrence appends one non-empty value.
+        if (value === undefined || value.trim().length === 0) {
+          throw new Error(`${flag.name} requires a value`);
+        }
+        const list = Array.isArray(bag[key]) ? bag[key] as string[] : [];
+        bag[key] = [...list, value];
       } else if (flag.kind === "boolString") {
         if (value === undefined) {
           throw new Error(`${flag.name} requires a value`);
@@ -144,9 +151,10 @@ function applyPositionals(
     if (value === undefined) {
       return;
     }
-    // Required positionals are ids; coerce with parseRequiredId so the
-    // "<label> must be a positive integer." message is produced.
-    bag[positional.name] = positional.required
+    // Required positionals are ids unless declared kind:"string"; coerce ids
+    // with parseRequiredId so the "<label> must be a positive integer." message
+    // is produced.
+    bag[positional.name] = positional.required && positional.kind !== "string"
       ? parseRequiredId(value, positional.label ?? positionalLabel(positional.name))
       : value;
   });
