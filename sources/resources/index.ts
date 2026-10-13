@@ -19,6 +19,7 @@ import { locationsResource } from "@/resources/locations";
 import { photosResource } from "@/resources/photos";
 import { searchResource } from "@/resources/search";
 import { statusResource } from "@/resources/status";
+import { threadsResource } from "@/resources/threads";
 import { todayResource } from "@/resources/today";
 import { todosResource } from "@/resources/todos";
 
@@ -35,5 +36,6 @@ export const RESOURCES: readonly ResourceModule[] = [
   locationsResource,
   photosResource,
   searchResource,
+  threadsResource,
   todosResource,
 ];

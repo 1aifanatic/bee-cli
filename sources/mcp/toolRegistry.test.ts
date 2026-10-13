@@ -7,8 +7,8 @@ import { TOOL_SNAPSHOT as SNAPSHOT } from "@/mcp/toolSnapshot";
 // schemas). When a domain intentionally ADDS a new bee_list_* tool (conversations
 // / journals), update the snapshot accordingly and bump the expected count here.
 describe("MCP tool registry derivation", () => {
-  it("derives the same 35 tools, in the same order, byte-identically", () => {
-    expect(DERIVED.length).toBe(35);
+  it("derives the same 41 tools, in the same order, byte-identically", () => {
+    expect(DERIVED.length).toBe(41);
     expect(DERIVED).toEqual(SNAPSHOT);
   });
 

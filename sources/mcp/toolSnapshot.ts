@@ -741,5 +741,218 @@ export const TOOL_SNAPSHOT: ToolDefinition[] = [
       ],
       "additionalProperties": false
     }
+  },
+  {
+    "name": "bee_list_threads",
+    "description": "List the user's Bee agent chat threads with thread_id, name, state (idle or running), created_at and updated_at.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bee_create_thread",
+    "description": "Start a new Bee agent chat thread with a first message (text and/or photos/files) and wait for the agent's answer. Returns the answer text and messages when completed. The result has status, thread_id and message_id at the top level. If status is \"pending\" (not answered in time, not an error) or \"stalled\", call bee_wait_thread with thread_id and message_id to keep waiting.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "maxLength": 100000,
+          "description": "Message text. Optional when files are attached."
+        },
+        "file_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Local paths of photos or files to attach (max 20, 25 MB each). Content type comes from the extension."
+        },
+        "inline_files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "string",
+                "description": "Base64 file content (a data: URL also works)."
+              },
+              "filename": {
+                "type": "string",
+                "description": "File name, e.g. photo.jpg; its extension sets the content type."
+              },
+              "content_type": {
+                "type": "string",
+                "description": "Optional MIME type, e.g. image/png."
+              }
+            },
+            "required": [
+              "data",
+              "filename"
+            ],
+            "additionalProperties": false
+          },
+          "description": "Files to attach given inline as base64, for content that is not on disk."
+        },
+        "timeout_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 3600,
+          "description": "Overall seconds to wait for the answer (default 45; 0 sends without waiting). Raise it only if your client allows long tool calls."
+        },
+        "client_message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Optional idempotency key (A-Z a-z 0-9 . _ : -). Re-sending with the same key does not send twice. Generated when omitted."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bee_send_thread_message",
+    "description": "Send a message (text and/or photos/files) to an existing Bee agent thread and wait for the agent's answer. The result has status, thread_id and message_id at the top level. If status is \"pending\" (not answered in time, not an error) or \"stalled\", call bee_wait_thread with thread_id and message_id to keep waiting.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "thread_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "Thread id from bee_list_threads or bee_create_thread."
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 100000,
+          "description": "Message text. Optional when files are attached."
+        },
+        "file_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Local paths of photos or files to attach (max 20, 25 MB each). Content type comes from the extension."
+        },
+        "inline_files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": "string",
+                "description": "Base64 file content (a data: URL also works)."
+              },
+              "filename": {
+                "type": "string",
+                "description": "File name, e.g. photo.jpg; its extension sets the content type."
+              },
+              "content_type": {
+                "type": "string",
+                "description": "Optional MIME type, e.g. image/png."
+              }
+            },
+            "required": [
+              "data",
+              "filename"
+            ],
+            "additionalProperties": false
+          },
+          "description": "Files to attach given inline as base64, for content that is not on disk."
+        },
+        "timeout_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 3600,
+          "description": "Overall seconds to wait for the answer (default 45; 0 sends without waiting). Raise it only if your client allows long tool calls."
+        },
+        "client_message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Optional idempotency key (A-Z a-z 0-9 . _ : -). Re-sending with the same key does not send twice. Generated when omitted."
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bee_wait_thread",
+    "description": "Keep waiting for the Bee agent's answer on a thread, e.g. after bee_create_thread or bee_send_thread_message returned status \"pending\". Waits after message_id, or after the thread's latest user message when message_id is omitted. Returns the same result shape (status, thread_id, message_id at the top level); call it again while status is \"pending\".",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "thread_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "Thread id."
+        },
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "Wait for the answer after this message (the message_id of a previous result). Defaults to the thread's latest user message."
+        },
+        "timeout_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 3600,
+          "description": "Overall seconds to wait for the answer (default 45; 0 sends without waiting). Raise it only if your client allows long tool calls."
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bee_get_thread_messages",
+    "description": "Get the messages of a Bee agent thread, oldest first: role, text, parts (text, attachments, tool calls) and timestamps. Returns the latest 50 by default; omitted_earlier counts older ones left out.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "thread_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "Thread id."
+        },
+        "limit": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Return only the latest N messages (default 50)."
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bee_abort_thread",
+    "description": "Stop the Bee agent's current work on a thread. The thread becomes idle; send a new message to continue.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "thread_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "Thread id."
+        }
+      },
+      "required": [
+        "thread_id"
+      ],
+      "additionalProperties": false
+    }
   }
 ];
