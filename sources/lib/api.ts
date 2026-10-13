@@ -30,6 +30,24 @@ type FactUpdateOptions = {
   confirmed?: boolean;
 };
 
+// Overall wait for an answer: seconds, or a duration such as "90s" or "5m".
+// 0 sends without waiting. The CLI default is 90 seconds.
+type ThreadTimeout = number | string;
+
+type ThreadSendOptions = {
+  text?: string;
+  photos?: string[];
+  files?: string[];
+  timeout?: ThreadTimeout;
+  clientMessageId?: string;
+};
+
+type ThreadWaitOptions = {
+  // Message id to wait after; defaults to the thread's latest user message.
+  after?: string;
+  timeout?: ThreadTimeout;
+};
+
 type SearchFilter = "conversations" | "daily" | "facts" | "all";
 type SearchSort = "relevance" | "mostRecent";
 
@@ -90,6 +108,14 @@ export type DataApi = {
   journals: {
     list: <T = unknown>(options?: ListOptions) => Promise<T>;
     get: <T = unknown>(id: string | number) => Promise<T>;
+  };
+  threads: {
+    list: <T = unknown>() => Promise<T>;
+    create: <T = unknown>(options: ThreadSendOptions) => Promise<T>;
+    send: <T = unknown>(threadId: string, options: ThreadSendOptions) => Promise<T>;
+    wait: <T = unknown>(threadId: string, options?: ThreadWaitOptions) => Promise<T>;
+    messages: <T = unknown>(threadId: string, options?: { limit?: number }) => Promise<T>;
+    abort: <T = unknown>(threadId: string) => Promise<T>;
   };
   search: <T = unknown>(options: SearchOptions) => Promise<T>;
 };
@@ -186,6 +212,27 @@ export function createDataApi(runner: BeeCliRunner): DataApi {
       },
       get: (id) => runner.runJson(["journals", "get", String(id)]),
     },
+    threads: {
+      list: () => runner.runJson(["threads", "list"]),
+      create: (options) => runner.runJson(["threads", "create", ...threadSendArgs(options)]),
+      send: (threadId, options) => runner.runJson(["threads", "send", threadId, ...threadSendArgs(options)]),
+      wait: (threadId, options) => {
+        const args = ["threads", "wait", threadId];
+        if (options?.after !== undefined) {
+          args.push("--after", options.after);
+        }
+        appendThreadTimeout(args, options?.timeout);
+        return runner.runJson(args);
+      },
+      messages: (threadId, options) => {
+        const args = ["threads", "messages", threadId];
+        if (options?.limit !== undefined) {
+          args.push("--limit", String(options.limit));
+        }
+        return runner.runJson(args);
+      },
+      abort: (threadId) => runner.runJson(["threads", "abort", threadId]),
+    },
     search: (options) => {
       const args = ["search", "--query", options.query];
       if (options.limit !== undefined) {
@@ -219,5 +266,29 @@ function appendListOptions(args: string[], options?: ListOptions): void {
   }
   if (options?.cursor) {
     args.push("--cursor", options.cursor);
+  }
+}
+
+function threadSendArgs(options: ThreadSendOptions): string[] {
+  const args: string[] = [];
+  if (options.text !== undefined) {
+    args.push("--text", options.text);
+  }
+  for (const photo of options.photos ?? []) {
+    args.push("--photo", photo);
+  }
+  for (const file of options.files ?? []) {
+    args.push("--file", file);
+  }
+  appendThreadTimeout(args, options.timeout);
+  if (options.clientMessageId !== undefined) {
+    args.push("--client-message-id", options.clientMessageId);
+  }
+  return args;
+}
+
+function appendThreadTimeout(args: string[], timeout: ThreadTimeout | undefined): void {
+  if (timeout !== undefined) {
+    args.push("--timeout", typeof timeout === "number" ? `${timeout}s` : timeout);
   }
 }

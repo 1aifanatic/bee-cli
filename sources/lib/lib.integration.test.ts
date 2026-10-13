@@ -165,6 +165,43 @@ describe("lib integration", () => {
   );
 
   it(
+    "data api builds threads arguments",
+    async () => {
+      const runner = createNodeRunner(
+        'console.log(JSON.stringify({ argv: process.argv.slice(1) }));'
+      );
+      const api = createDataApi(runner);
+
+      const created = (await api.threads.create({
+        text: "Plan my trip",
+        photos: ["a.jpg", "b.png"],
+        files: ["notes.pdf"],
+        timeout: 120,
+        clientMessageId: "abc-1",
+      })) as { argv: string[] };
+      const sent = (await api.threads.send("t1", { text: "More", timeout: "5m" })) as { argv: string[] };
+      const waited = (await api.threads.wait("t1", { after: "m1", timeout: 0 })) as { argv: string[] };
+      const bareWait = (await api.threads.wait("t1")) as { argv: string[] };
+      const messages = (await api.threads.messages("t1", { limit: 5 })) as { argv: string[] };
+      const aborted = (await api.threads.abort("t1")) as { argv: string[] };
+      const listed = (await api.threads.list()) as { argv: string[] };
+
+      expect(created.argv).toEqual([
+        "threads", "create", "--text", "Plan my trip",
+        "--photo", "a.jpg", "--photo", "b.png", "--file", "notes.pdf",
+        "--timeout", "120s", "--client-message-id", "abc-1", "--json",
+      ]);
+      expect(sent.argv).toEqual(["threads", "send", "t1", "--text", "More", "--timeout", "5m", "--json"]);
+      expect(waited.argv).toEqual(["threads", "wait", "t1", "--after", "m1", "--timeout", "0s", "--json"]);
+      expect(bareWait.argv).toEqual(["threads", "wait", "t1", "--json"]);
+      expect(messages.argv).toEqual(["threads", "messages", "t1", "--limit", "5", "--json"]);
+      expect(aborted.argv).toEqual(["threads", "abort", "t1", "--json"]);
+      expect(listed.argv).toEqual(["threads", "list", "--json"]);
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
     "sse stream yields json lines",
     async () => {
       const runner = createNodeRunner(

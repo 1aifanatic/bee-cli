@@ -63,6 +63,8 @@ bee mcp serve-http [--port N]   # local HTTP, 127.0.0.1, bearer-token auth
 
 Every read, search, and manage capability below is exposed as an MCP tool (`bee_search`, `bee_list_facts`, `bee_get_daily_summary`, …), so the CLI and your assistant work from the same data.
 
+For Bee test users, the thread tools let an assistant chat with the Bee agent: `bee_create_thread`, `bee_send_thread_message`, `bee_wait_thread`, `bee_list_threads`, `bee_get_thread_messages`, and `bee_abort_thread`. Send tools attach local files (`file_paths`) or inline base64 files (`inline_files`). They wait up to `timeout_seconds` (default 45, under the roughly 60-second limit many MCP clients put on a tool call; `0` sends without waiting). Every result has `status`, `thread_id`, and `message_id` at the top level. When `status` is `pending`, call `bee_wait_thread` with those ids to keep waiting.
+
 ## Installation
 
 Install from npm:
@@ -90,6 +92,13 @@ import { createBeeClient } from "@beeai/cli/lib";
 
 const bee = createBeeClient();
 const profile = await bee.api.me();
+
+// Test users: chat with the Bee agent; keep waiting while status is "pending".
+type Answer = { status: string; thread_id: string; message_id: string; text?: string };
+let answer = await bee.api.threads.create<Answer>({ text: "Plan my day", timeout: 120 });
+while (answer.status === "pending") {
+  answer = await bee.api.threads.wait<Answer>(answer.thread_id, { after: answer.message_id });
+}
 
 const stream = bee.sse.streamJson({ types: ["new-utterance"] });
 for await (const event of stream.events) {
@@ -168,6 +177,18 @@ By default, data commands return markdown. Use `--json` to print raw JSON.
 
 - `search` - Search your Bee data.
   - `search --query <text>` - Keyword search (default) across conversations, daily summaries, and facts. Scope with `--filter conversations|daily|facts|all` and order with `--sort relevance|mostRecent`. Use `--neural` for semantic conversation search (conversations only; `--filter`/`--sort` do not apply). Bound either mode by time with `--since`/`--until` (epoch milliseconds). Options: `--limit N`, `--json`.
+
+- `threads` - Chat with the Bee agent in threads (Bee test users only).
+  - `threads list` - List threads with their id, name, and state (`idle` or `running`). Options: `--json`.
+  - `threads create --text <text>` - Start a new thread with a first message and wait for the answer. Options: `--photo <path>` and `--file <path>` (repeatable; uploaded first, max 20 per message, 25 MB each), `--timeout <duration>`, `--client-message-id <id>`, `--json`.
+  - `threads send <thread-id> --text <text>` - Send a message to an existing thread and wait for the answer. Same options as `create`.
+  - `threads wait <thread-id>` - Keep waiting for the answer. Waits after the thread's latest user message, or after `--after <message-id>`. Options: `--after <message-id>`, `--timeout <duration>`, `--json`.
+  - `threads messages <thread-id>` - Show the thread's messages, oldest first. Options: `--limit N` (latest N), `--json`.
+  - `threads abort <thread-id>` - Stop the agent's current work on the thread. Options: `--json`.
+
+  `--timeout` is the overall wait for the answer, e.g. `30s`, `5m`, or `1h` (a bare number is seconds). It defaults to `90s`, and `0` sends without waiting. Longer waits are split into server calls of up to 55 seconds. When the answer is not ready in time, the command still succeeds: it prints the thread id, the message id, `status: pending`, and a `bee threads wait <thread-id>` hint. A `stalled` status means the agent has not reported progress for a while: wait again, or abort and send again. The answer text comes first in markdown output; `--json` prints the full payload (`status`, `thread_id`, `message_id`, `text`, `messages`, `client_message_id`, `files`).
+
+  Each send carries a `client_message_id`, generated unless you pass `--client-message-id`. Retries after network errors or 5xx responses reuse it, so a message is never sent twice. Re-running `create` with the same id returns the same thread. Attaching photos or files requires the Bee agent consent in the Bee app.
 
 - `mcp` - Run or connect the MCP server (see [Use Bee with AI assistants](#use-bee-with-ai-assistants-mcp)). Subcommands: `serve`, `serve-http [--port N] [--token VALUE]`, `connect|disconnect <claude|claude-code|codex>`, `status`.
 
