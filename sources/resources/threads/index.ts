@@ -19,11 +19,11 @@ import { emptySchema, objectSchema } from "@/resources/schema";
 import {
   abortThread,
   getThreadMessages,
-  latestUserMessageId,
   listThreads,
   sendAndWait,
   uploadAttachment,
   waitForAnswer,
+  ThreadsInterruptedError,
   type ThreadAnswer,
   type UploadedFile,
 } from "@/resources/threads/api";
@@ -52,8 +52,9 @@ const USAGE = [
   "bee threads messages <thread-id> [--limit N] [--json]",
   "bee threads abort <thread-id> [--json]",
   "",
-  "--timeout is the overall wait for the answer (e.g. 30s, 5m, 1h; default 90s; 0 sends without waiting).",
-  "If the answer is not ready in time, the thread id is printed; continue with \"bee threads wait <thread-id>\".",
+  "--timeout bounds the whole send and wait, retries included (e.g. 30s, 5m, 1h; default 90s; 0 sends without",
+  "waiting). If the answer is not ready in time, the thread id is printed; continue with \"bee threads wait <thread-id>\".",
+  "Every send prints its client_message_id; re-running with --client-message-id <id> resumes it without sending twice.",
 ].join("\n");
 
 export const CLI_DEFAULT_TIMEOUT_MS = 90_000;
@@ -201,17 +202,31 @@ async function runSend(ctx: ActionContext, input: SendInput): Promise<ActionResu
   // Read every local file before uploading any, so a bad path uploads nothing.
   const loaded = input.attachments.map(loadAttachment);
   const files: UploadedFile[] = [];
-  for (const file of loaded) {
-    files.push(await uploadAttachment(ctx, file));
+  for (const [index, file] of loaded.entries()) {
+    try {
+      files.push(await uploadAttachment(ctx, file));
+    } catch (error) {
+      // Earlier uploads stay unattached on the server; the message is not sent.
+      const detail = error instanceof Error ? error.message : "unexpected error";
+      throw new Error(`Could not upload ${file.filename} (file ${index + 1} of ${loaded.length}), so nothing was sent. ${detail}`);
+    }
   }
-  const answer = await sendAndWait(ctx, {
-    threadId: input.threadId,
-    text: input.text,
-    fileIds: files.map((file) => file.file_id),
-    clientMessageId: input.clientMessageId,
-    timeoutMs: input.timeoutMs,
-    onWaiting: waitingNotice(input.surface),
-  });
+  let answer: ThreadAnswer;
+  try {
+    answer = await sendAndWait(ctx, {
+      threadId: input.threadId,
+      text: input.text,
+      fileIds: files.map((file) => file.file_id),
+      clientMessageId: input.clientMessageId,
+      timeoutMs: input.timeoutMs,
+      onWaiting: waitingNotice(input.surface),
+    });
+  } catch (error) {
+    if (error instanceof ThreadsInterruptedError) {
+      throw new Error(`${error.message} ${resumeAdvice(error, input.surface, input.clientMessageId)}`);
+    }
+    throw error;
+  }
   return {
     kind: "json",
     data: answerPayload(answer, input.surface, {
@@ -266,12 +281,12 @@ const SEND_PROPERTIES: JsonObject = {
     type: "string",
     minLength: 1,
     maxLength: 128,
-    description: "Optional idempotency key (A-Z a-z 0-9 . _ : -). Re-sending with the same key does not send twice. Generated when omitted.",
+    description: "Idempotency key (A-Z a-z 0-9 . _ : -), generated when omitted and returned in every result. Calling again with the same key and thread resumes the same message instead of sending it twice.",
   },
 };
 
 const NEXT_STEP =
-  "The result has status, thread_id and message_id at the top level. If status is \"pending\" (not answered in time, not an error) or \"stalled\", call bee_wait_thread with thread_id and message_id to keep waiting.";
+  "The result has status, thread_id, message_id and client_message_id at the top level. If status is \"pending\" (not answered in time, not an error) or \"stalled\", call bee_wait_thread with thread_id and message_id to keep waiting. If message_id is null, Bee did not confirm the send in time: call this tool again with the same client_message_id, which never sends twice. If a call is cut off before it returns, bee_wait_thread with just the thread_id resumes (bee_list_threads finds a new thread); passing your own client_message_id lets you resume the send itself.";
 
 const createThread: ActionDefinition<SendInput> = {
   mcp: {
@@ -334,7 +349,7 @@ const waitThread: ActionDefinition<WaitInput> = {
   mcp: {
     name: "bee_wait_thread",
     description:
-      "Keep waiting for the Bee agent's answer on a thread, e.g. after bee_create_thread or bee_send_thread_message returned status \"pending\". Waits after message_id, or after the thread's latest user message when message_id is omitted. Returns the same result shape (status, thread_id, message_id at the top level); call it again while status is \"pending\".",
+      "Keep waiting for the Bee agent's answer on a thread, e.g. after bee_create_thread or bee_send_thread_message returned status \"pending\". Waits after message_id, or after the thread's latest user message when message_id is omitted. Returns the same result shape (status, thread_id, message_id at the top level); call it again while status is \"pending\". message_id is null only if the timeout passed before the latest user message was found.",
     inputSchema: objectSchema({
       properties: {
         thread_id: { type: "string", minLength: 1, maxLength: 255, description: "Thread id." },
@@ -363,13 +378,20 @@ const waitThread: ActionDefinition<WaitInput> = {
     return { surface, threadId: threadIdArg(raw, surface), after, timeoutMs: timeoutArg(raw, surface) };
   },
   run: async (ctx, input) => {
-    const after = input.after ?? await latestUserMessageId(ctx, input.threadId);
-    const answer = await waitForAnswer(ctx, {
-      threadId: input.threadId,
-      after,
-      timeoutMs: input.timeoutMs,
-      onWaiting: waitingNotice(input.surface),
-    });
+    let answer: ThreadAnswer;
+    try {
+      answer = await waitForAnswer(ctx, {
+        threadId: input.threadId,
+        after: input.after,
+        timeoutMs: input.timeoutMs,
+        onWaiting: waitingNotice(input.surface),
+      });
+    } catch (error) {
+      if (error instanceof ThreadsInterruptedError) {
+        throw new Error(`${error.message} ${resumeAdvice(error, input.surface, null)}`);
+      }
+      throw error;
+    }
     return { kind: "json", data: answerPayload(answer, input.surface, {}) };
   },
 };
@@ -500,19 +522,26 @@ function answerPayload(
   surface: Surface,
   extra: { client_message_id?: string; files?: UploadedFile[] }
 ): { [key: string]: unknown } {
-  const hint = answerHint(answer, surface);
+  const { client_message_id: clientMessageId, ...rest } = extra;
+  const hint = answerHint(answer, surface, clientMessageId ?? null);
   return {
     status: answer.status,
     thread_id: answer.thread_id,
     message_id: answer.message_id,
+    ...(clientMessageId !== undefined ? { client_message_id: clientMessageId } : {}),
     ...(hint ? { hint } : {}),
     ...(answer.status === "completed" ? { text: answer.text ?? "", messages: answer.messages ?? [] } : {}),
-    ...extra,
+    ...rest,
   };
 }
 
-function answerHint(answer: ThreadAnswer, surface: Surface): string | null {
+function answerHint(answer: ThreadAnswer, surface: Surface, clientMessageId: string | null): string | null {
   const id = answer.thread_id;
+  if (!answer.confirmed && clientMessageId !== null) {
+    return surface === "cli"
+      ? `Bee did not confirm the send before the timeout. Re-run the same command with --client-message-id ${clientMessageId} to resume; it will not send twice.`
+      : `Bee did not confirm the send before the timeout. Call the same tool again with client_message_id "${clientMessageId}" to resume; it will not send twice.`;
+  }
   if (answer.status === "pending") {
     return surface === "cli"
       ? `Not answered yet. Run "bee threads wait ${id}" to keep waiting.`
@@ -524,6 +553,27 @@ function answerHint(answer: ThreadAnswer, surface: Surface): string | null {
       : "The agent has reported no progress for a while. Call bee_wait_thread to check again, or bee_abort_thread and send again.";
   }
   return null;
+}
+
+// How to continue after a send or wait was interrupted by a network error,
+// a client-side timeout or a 5xx, when the message may already be stored.
+function resumeAdvice(error: ThreadsInterruptedError, surface: Surface, clientMessageId: string | null): string {
+  if (!error.sendConfirmed && clientMessageId !== null) {
+    return surface === "cli"
+      ? `The message may have been sent. Re-run the same command with --client-message-id ${clientMessageId} to resume without sending twice.`
+      : `The message may have been sent. Call the same tool again with client_message_id "${clientMessageId}" to resume without sending twice.`;
+  }
+  const thread = error.threadId ?? "(unknown)";
+  const after = error.messageId;
+  const key = clientMessageId !== null ? ` (client_message_id ${clientMessageId})` : "";
+  if (surface === "cli") {
+    return after !== null
+      ? `The message${key} was sent. Run "bee threads wait ${thread} --after ${after}" to keep waiting.`
+      : `Run "bee threads wait ${thread}" to try again.`;
+  }
+  return after !== null
+    ? `The message${key} was sent. Call bee_wait_thread with thread_id "${thread}" and message_id "${after}" to keep waiting.`
+    : `Call bee_wait_thread with thread_id "${thread}" to try again.`;
 }
 
 function renderAnswer(result: ActionResult, format: OutputFormat): void {
@@ -540,9 +590,12 @@ function renderAnswer(result: ActionResult, format: OutputFormat): void {
     const text = typeof data["text"] === "string" ? data["text"].trim() : "";
     lines.push(text.length > 0 ? text : "(The agent finished without a text reply.)", "");
   }
-  lines.push(`- thread_id: ${String(data["thread_id"])}`);
-  lines.push(`- message_id: ${String(data["message_id"])}`);
+  lines.push(`- thread_id: ${String(data["thread_id"] ?? "(not confirmed)")}`);
+  lines.push(`- message_id: ${String(data["message_id"] ?? "(not confirmed)")}`);
   lines.push(`- status: ${String(data["status"])}`);
+  if (typeof data["client_message_id"] === "string") {
+    lines.push(`- client_message_id: ${data["client_message_id"]}`);
+  }
   const files = Array.isArray(data["files"]) ? data["files"] : [];
   if (files.length > 0) {
     lines.push(`- files: ${files.map((file) => String(asRecord(file)["filename"])).join(", ")}`);

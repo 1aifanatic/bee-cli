@@ -753,7 +753,7 @@ export const TOOL_SNAPSHOT: ToolDefinition[] = [
   },
   {
     "name": "bee_create_thread",
-    "description": "Start a new Bee agent chat thread with a first message (text and/or photos/files) and wait for the agent's answer. Returns the answer text and messages when completed. The result has status, thread_id and message_id at the top level. If status is \"pending\" (not answered in time, not an error) or \"stalled\", call bee_wait_thread with thread_id and message_id to keep waiting.",
+    "description": "Start a new Bee agent chat thread with a first message (text and/or photos/files) and wait for the agent's answer. Returns the answer text and messages when completed. The result has status, thread_id, message_id and client_message_id at the top level. If status is \"pending\" (not answered in time, not an error) or \"stalled\", call bee_wait_thread with thread_id and message_id to keep waiting. If message_id is null, Bee did not confirm the send in time: call this tool again with the same client_message_id, which never sends twice. If a call is cut off before it returns, bee_wait_thread with just the thread_id resumes (bee_list_threads finds a new thread); passing your own client_message_id lets you resume the send itself.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -805,7 +805,7 @@ export const TOOL_SNAPSHOT: ToolDefinition[] = [
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "description": "Optional idempotency key (A-Z a-z 0-9 . _ : -). Re-sending with the same key does not send twice. Generated when omitted."
+          "description": "Idempotency key (A-Z a-z 0-9 . _ : -), generated when omitted and returned in every result. Calling again with the same key and thread resumes the same message instead of sending it twice."
         }
       },
       "additionalProperties": false
@@ -813,7 +813,7 @@ export const TOOL_SNAPSHOT: ToolDefinition[] = [
   },
   {
     "name": "bee_send_thread_message",
-    "description": "Send a message (text and/or photos/files) to an existing Bee agent thread and wait for the agent's answer. The result has status, thread_id and message_id at the top level. If status is \"pending\" (not answered in time, not an error) or \"stalled\", call bee_wait_thread with thread_id and message_id to keep waiting.",
+    "description": "Send a message (text and/or photos/files) to an existing Bee agent thread and wait for the agent's answer. The result has status, thread_id, message_id and client_message_id at the top level. If status is \"pending\" (not answered in time, not an error) or \"stalled\", call bee_wait_thread with thread_id and message_id to keep waiting. If message_id is null, Bee did not confirm the send in time: call this tool again with the same client_message_id, which never sends twice. If a call is cut off before it returns, bee_wait_thread with just the thread_id resumes (bee_list_threads finds a new thread); passing your own client_message_id lets you resume the send itself.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -871,7 +871,7 @@ export const TOOL_SNAPSHOT: ToolDefinition[] = [
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "description": "Optional idempotency key (A-Z a-z 0-9 . _ : -). Re-sending with the same key does not send twice. Generated when omitted."
+          "description": "Idempotency key (A-Z a-z 0-9 . _ : -), generated when omitted and returned in every result. Calling again with the same key and thread resumes the same message instead of sending it twice."
         }
       },
       "required": [
@@ -882,7 +882,7 @@ export const TOOL_SNAPSHOT: ToolDefinition[] = [
   },
   {
     "name": "bee_wait_thread",
-    "description": "Keep waiting for the Bee agent's answer on a thread, e.g. after bee_create_thread or bee_send_thread_message returned status \"pending\". Waits after message_id, or after the thread's latest user message when message_id is omitted. Returns the same result shape (status, thread_id, message_id at the top level); call it again while status is \"pending\".",
+    "description": "Keep waiting for the Bee agent's answer on a thread, e.g. after bee_create_thread or bee_send_thread_message returned status \"pending\". Waits after message_id, or after the thread's latest user message when message_id is omitted. Returns the same result shape (status, thread_id, message_id at the top level); call it again while status is \"pending\". message_id is null only if the timeout passed before the latest user message was found.",
     "inputSchema": {
       "type": "object",
       "properties": {

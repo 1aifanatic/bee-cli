@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CommandContext } from "@/commands/types";
@@ -22,6 +22,8 @@ beforeEach(() => {
   THREAD_TIMING.responseMarginMs = 2_000;
   THREAD_TIMING.retryDelaysMs = [5, 5, 5];
   THREAD_TIMING.minPollIntervalMs = 0;
+  THREAD_TIMING.responseReserveMs = 50;
+  THREAD_TIMING.minFirstCallMs = 500;
 });
 
 afterEach(() => {
@@ -180,13 +182,18 @@ describe("threads CLI argument coercion", () => {
 describe("threads MCP argument coercion", () => {
   it("defaults timeout_seconds to 45 and clamps it", async () => {
     THREAD_TIMING.chunkMs = 120_000;
+    THREAD_TIMING.responseReserveMs = 2_000;
     const { ctx, seen } = mockBee(() => completed());
+    const waitMs = (index: number) => Number(bodyOf(seen[index]!)["wait_ms"]);
+    // The server is asked to answer the reserve before the deadline.
     await callTool(ctx, "bee_send_thread_message", { thread_id: "t1", text: "hi" });
-    expect(bodyOf(seen[0]!)["wait_ms"]).toBe(45_000);
+    expect(waitMs(0)).toBeGreaterThan(42_900);
+    expect(waitMs(0)).toBeLessThanOrEqual(43_000);
     await callTool(ctx, "bee_send_thread_message", { thread_id: "t1", text: "hi", timeout_seconds: -3 });
-    expect(bodyOf(seen[1]!)["wait_ms"]).toBe(0);
+    expect(waitMs(1)).toBe(0);
     await callTool(ctx, "bee_send_thread_message", { thread_id: "t1", text: "hi", timeout_seconds: "100" });
-    expect(bodyOf(seen[2]!)["wait_ms"]).toBe(100_000);
+    expect(waitMs(2)).toBeGreaterThan(97_900);
+    expect(waitMs(2)).toBeLessThanOrEqual(98_000);
   });
 
   it("requires thread_id and text or files", async () => {
@@ -326,6 +333,95 @@ describe("threads wait pacing", () => {
   });
 });
 
+describe("threads overall deadline", () => {
+  // Real-world margins: without the deadline these would let one call run
+  // for wait_ms + 30 s and retry after that.
+  beforeEach(() => {
+    THREAD_TIMING.responseMarginMs = 30_000;
+    THREAD_TIMING.retryDelaysMs = [400, 400, 400];
+  });
+
+  it("returns a resumable pending result when a wait never answers", async () => {
+    const { ctx } = mockBee(async (request) => {
+      if (request.method === "POST") {
+        return waiting("pending", "t1", "m1");
+      }
+      await Bun.sleep(5_000);
+      return completed();
+    });
+    const started = Date.now();
+    const result = await callTool(ctx, "bee_send_thread_message", { thread_id: "t1", text: "hi", timeout_seconds: 1, client_message_id: "k-1" });
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(result).toMatchObject({ status: "pending", thread_id: "t1", message_id: "m1", client_message_id: "k-1" });
+    expect(String(result["hint"])).toContain("bee_wait_thread");
+  });
+
+  it("returns an unconfirmed pending result when the send never answers", async () => {
+    const { ctx } = mockBee(async () => {
+      await Bun.sleep(5_000);
+      return completed();
+    });
+    const started = Date.now();
+    const { logs } = await runCli(ctx, ["create", "--text", "hi", "--timeout", "1s", "--client-message-id", "k-2"]);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    const output = logs.join("\n");
+    expect(output).toContain("- thread_id: (not confirmed)");
+    expect(output).toContain("- message_id: (not confirmed)");
+    expect(output).toContain("- status: pending");
+    expect(output).toContain("Re-run the same command with --client-message-id k-2 to resume; it will not send twice.");
+  });
+
+  it("stops retrying 5xx when the backoff would pass the deadline", async () => {
+    const { ctx, seen } = mockBee((request) =>
+      request.method === "POST" ? waiting("pending", "t1", "m1") : Response.json({ error: "internal" }, { status: 500 })
+    );
+    const started = Date.now();
+    const data = await runCliJson(ctx, ["send", "t1", "--text", "hi", "--timeout", "1s"]);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(data).toMatchObject({ status: "pending", thread_id: "t1", message_id: "m1" });
+    expect(seen.length).toBeLessThanOrEqual(4);
+  });
+
+  it("still sends with --timeout 0 when the first attempt fails", async () => {
+    THREAD_TIMING.retryDelaysMs = [5, 5, 5];
+    const { ctx, seen } = mockBee((_request, index) => index === 0 ? new Response("oops", { status: 502 }) : waiting("pending", "t1", "m1"));
+    const data = await runCliJson(ctx, ["send", "t1", "--text", "hi", "--timeout", "0"]);
+    expect(data).toMatchObject({ status: "pending", message_id: "m1" });
+    expect(seen.length).toBe(2);
+  });
+});
+
+describe("threads client_message_id surfacing", () => {
+  it("shows client_message_id in markdown output", async () => {
+    const { ctx } = mockBee(() => completed());
+    const { logs } = await runCli(ctx, ["create", "--text", "hi"]);
+    expect(logs.join("\n")).toMatch(/- client_message_id: bee-cli-[0-9a-f-]{36}/);
+  });
+
+  it("names the key to resume with when the send may have committed (CLI)", async () => {
+    const { ctx } = mockBee(() => Response.json({ error: "internal" }, { status: 500 }));
+    await expect(threadsCommand.run(["send", "t1", "--text", "hi", "--client-message-id", "k-3"], ctx)).rejects.toThrow(
+      "Bee request failed with status 500: internal The message may have been sent. Re-run the same command with --client-message-id k-3 to resume without sending twice."
+    );
+  });
+
+  it("names the generated key when the send may have committed (MCP)", async () => {
+    const { ctx, seen } = mockBee(() => Response.json({ error: "internal" }, { status: 500 }));
+    const failure = await callBeeTool(ctx, "bee_create_thread", { text: "hi" }).then(() => null, (error: Error) => error.message);
+    const key = String(bodyOf(seen[0]!)["client_message_id"]);
+    expect(failure).toContain(`Call the same tool again with client_message_id "${key}" to resume without sending twice.`);
+  });
+
+  it("says how to keep waiting when a wait fails after a confirmed send", async () => {
+    const { ctx } = mockBee((request) =>
+      request.method === "POST" ? waiting("pending", "t1", "m1") : Response.json({ error: "internal" }, { status: 500 })
+    );
+    await expect(threadsCommand.run(["send", "t1", "--text", "hi", "--timeout", "30s", "--client-message-id", "k-4"], ctx)).rejects.toThrow(
+      'The message (client_message_id k-4) was sent. Run "bee threads wait t1 --after m1" to keep waiting.'
+    );
+  });
+});
+
 describe("threads wait `after` resolution", () => {
   const history = {
     thread_id: "t1",
@@ -457,6 +553,54 @@ describe("threads attachments", () => {
     expect(bodyOf(seen[1]!)).toMatchObject({ text: "", file_ids: ["f1"] });
   });
 
+  it("rejects an oversized file before uploading anything", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bee-threads-"));
+    const big = join(dir, "big.png");
+    writeFileSync(big, "");
+    truncateSync(big, 25 * 1024 * 1024 + 1); // sparse: no 25 MB write
+    const small = join(dir, "small.png");
+    writeFileSync(small, pngBytes(1, 1));
+    const { ctx, seen } = mockBee(() => Response.json({}));
+    await expect(threadsCommand.run(["create", "--photo", small, "--photo", big], ctx)).rejects.toThrow(`File too large (max 25 MB): ${big}`);
+    expect(seen.length).toBe(0);
+  });
+
+  it("rejects a missing file before uploading anything", async () => {
+    const { ctx, seen } = mockBee(() => Response.json({}));
+    await expect(threadsCommand.run(["create", "--file", "/nonexistent/notes.pdf"], ctx)).rejects.toThrow("Cannot read /nonexistent/notes.pdf: no such file");
+    expect(seen.length).toBe(0);
+  });
+
+  it("uploads a file of unknown type as application/octet-stream", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bee-threads-"));
+    const blob = join(dir, "data.xyz");
+    writeFileSync(blob, "bytes");
+    const { ctx, seen } = mockBee((request) =>
+      request.path === "/v1/threads/attachments"
+        ? Response.json({ file_id: "f1", kind: "file", filename: "data.xyz", content_type: "application/octet-stream", size_bytes: 5, width: null, height: null })
+        : completed()
+    );
+    await runCliJson(ctx, ["create", "--file", blob]);
+    expect(seen[0]!.body).toContain("Content-Type: application/octet-stream");
+  });
+
+  it("does not send when a later upload fails, and says which file failed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bee-threads-"));
+    const photo = join(dir, "a.png");
+    const doc = join(dir, "notes.txt");
+    writeFileSync(photo, pngBytes(1, 1));
+    writeFileSync(doc, "hello");
+    const { ctx, seen } = mockBee((_request, index) =>
+      index === 0
+        ? Response.json({ file_id: "f1", kind: "image", filename: "a.png", content_type: "image/png", size_bytes: 33, width: 1, height: 1 })
+        : Response.json({ error: "Uploaded file is empty" }, { status: 400 })
+    );
+    await expect(threadsCommand.run(["create", "--photo", photo, "--file", doc, "--text", "x"], ctx)).rejects.toThrow(
+      "Could not upload notes.txt (file 2 of 2), so nothing was sent. Bee request failed with status 400: Uploaded file is empty"
+    );
+    expect(seen.map((entry) => entry.path)).toEqual(["/v1/threads/attachments", "/v1/threads/attachments"]);
+  });
+
   it("maps agent_vm_consent_required and does not send", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bee-threads-"));
     const photo = join(dir, "a.png");
@@ -486,6 +630,11 @@ describe("threads error mapping", () => {
     const { ctx } = mockBee(() => Response.json({ error: "message_not_in_thread" }, { status: 400 }));
     await expect(threadsCommand.run(["wait", "t1", "--after", "m0"], ctx))
       .rejects.toThrow("Message m0 is not in thread t1 (message_not_in_thread).");
+  });
+
+  it("explains a server without the Threads API", async () => {
+    const { ctx } = mockBee(() => Response.json({ message: "Route GET:/v1/threads not found", error: "Not Found", statusCode: 404 }, { status: 404 }));
+    await expect(threadsCommand.run(["list"], ctx)).rejects.toThrow("This Bee server does not have the Threads API yet (Route GET:/v1/threads not found).");
   });
 
   it("maps the remaining codes and falls back to the server message", () => {
