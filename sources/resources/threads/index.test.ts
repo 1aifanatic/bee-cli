@@ -11,7 +11,7 @@ import { parseDuration } from "@/resources/threads";
 
 type BunServer = ReturnType<typeof Bun.serve>;
 
-type Seen = { method: string; path: string; query: URLSearchParams; body: string; contentType: string };
+type Seen = { method: string; path: string; query: URLSearchParams; body: string; contentType: string; at: number };
 
 const activeServers: BunServer[] = [];
 const DEFAULT_TIMING = { ...THREAD_TIMING, retryDelaysMs: [...THREAD_TIMING.retryDelaysMs] };
@@ -39,6 +39,7 @@ function mockBee(handler: (seen: Seen, index: number) => Response | Promise<Resp
     fetch: async (request) => {
       const url = new URL(request.url);
       const entry: Seen = {
+        at: Date.now(),
         method: request.method,
         path: url.pathname,
         query: url.searchParams,
@@ -299,6 +300,32 @@ describe("threads send and wait", () => {
   });
 });
 
+describe("threads wait pacing", () => {
+  const holdThenPending = async (request: Seen) => {
+    const waitMs = request.method === "GET" ? Number(request.query.get("wait_ms")) : Number(bodyOf(request)["wait_ms"]);
+    await Bun.sleep(waitMs);
+    return waiting("pending", "t1", "m1");
+  };
+
+  it("starts the next wait at once after a full-length call", async () => {
+    THREAD_TIMING.chunkMs = 500;
+    THREAD_TIMING.minPollIntervalMs = 400;
+    const { ctx, seen } = mockBee(holdThenPending);
+    await runCliJson(ctx, ["send", "t1", "--text", "hi", "--timeout", "800ms"]);
+    expect(seen.length).toBe(2);
+    // The send held 500 ms, longer than the poll interval: no extra pause.
+    expect(seen[1]!.at - seen[0]!.at).toBeLessThan(750);
+  });
+
+  it("spaces out wait calls when the server answers pending early", async () => {
+    THREAD_TIMING.minPollIntervalMs = 200;
+    const { ctx, seen } = mockBee(() => waiting("pending", "t1", "m1"));
+    await runCliJson(ctx, ["wait", "t1", "--after", "m1", "--timeout", "1s"]);
+    expect(seen.length).toBeGreaterThanOrEqual(3);
+    expect(seen.length).toBeLessThanOrEqual(7);
+  });
+});
+
 describe("threads wait `after` resolution", () => {
   const history = {
     thread_id: "t1",
@@ -356,6 +383,16 @@ describe("threads retries", () => {
     const data = await runCliJson(ctx, ["send", "t1", "--text", "hi", "--timeout", "0", "--client-message-id", "retry-1"]);
     expect(data["status"]).toBe("completed");
     expect(seen.map((entry) => bodyOf(entry)["client_message_id"])).toEqual(["retry-1", "retry-1"]);
+  });
+
+  it("reports a request that never answers after the retries", async () => {
+    THREAD_TIMING.responseMarginMs = 50;
+    const { ctx, seen } = mockBee(async () => {
+      await Bun.sleep(300);
+      return Response.json({ threads: [] });
+    });
+    await expect(threadsCommand.run(["list"], ctx)).rejects.toThrow("Bee did not answer within 0 s.");
+    expect(seen.length).toBe(4);
   });
 
   it("gives up after the retries and reports the last 5xx", async () => {

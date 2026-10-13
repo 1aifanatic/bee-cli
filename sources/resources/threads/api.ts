@@ -139,7 +139,8 @@ export type SendRequest = {
 // passes; in that last case it returns the pending answer, not an error.
 // Retries reuse clientMessageId, so the server never sends the message twice.
 export async function sendAndWait(ctx: CommandContext, send: SendRequest): Promise<ThreadAnswer> {
-  const deadline = Date.now() + send.timeoutMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + send.timeoutMs;
   const path = send.threadId === null ? "/v1/threads" : threadPath(send.threadId, "messages");
   const scope = send.threadId === null ? {} : { threadId: send.threadId };
   const fetched = await request(ctx, path, {
@@ -157,27 +158,31 @@ export async function sendAndWait(ctx: CommandContext, send: SendRequest): Promi
       };
     },
   });
-  return await keepWaiting(ctx, toAnswer(fetched, scope), deadline, send.onWaiting);
+  return await keepWaiting(ctx, toAnswer(fetched, scope), startedAt, deadline, send.onWaiting);
 }
 
 export async function waitForAnswer(
   ctx: CommandContext,
   wait: { threadId: string; after: string; timeoutMs: number; onWaiting: ((answer: ThreadAnswer) => void) | undefined }
 ): Promise<ThreadAnswer> {
-  const deadline = Date.now() + wait.timeoutMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + wait.timeoutMs;
   const answer = await waitOnce(ctx, wait.threadId, wait.after, deadline);
-  return await keepWaiting(ctx, answer, deadline, wait.onWaiting);
+  return await keepWaiting(ctx, answer, startedAt, deadline, wait.onWaiting);
 }
 
+// firstCallAt is when the call that produced `first` started; pacing counts
+// from the start of each call, so a full-length wait is followed at once.
 async function keepWaiting(
   ctx: CommandContext,
   first: ThreadAnswer,
+  firstCallAt: number,
   deadline: number,
   onWaiting: ((answer: ThreadAnswer) => void) | undefined
 ): Promise<ThreadAnswer> {
   let answer = first;
   let notified = false;
-  let lastCallAt = Date.now();
+  let lastCallAt = firstCallAt;
   while (answer.status === "pending" && Date.now() < deadline) {
     if (!notified) {
       onWaiting?.(answer);

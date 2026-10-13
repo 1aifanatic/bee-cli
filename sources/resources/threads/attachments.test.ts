@@ -44,6 +44,14 @@ describe("thread attachments", () => {
     expect(imageSize(jpegBytes(4032, 3024, 6))).toEqual({ width: 3024, height: 4032 });
   });
 
+  it("keeps the JPEG size when the EXIF block is malformed", () => {
+    // APP1 "Exif" whose IFD0 offset points far outside the segment.
+    const payload = [0x45, 0x78, 0x69, 0x66, 0, 0, 0x4d, 0x4d, 0x00, 0x2a, 0x7f, 0xff, 0xff, 0xff];
+    const app1 = [0xff, 0xe1, 0, payload.length + 2, ...payload];
+    const sof = [0xff, 0xc0, 0, 17, 8, 0x01, 0xe0, 0x02, 0x80, 3, ...new Array(9).fill(0)];
+    expect(imageSize(new Uint8Array([0xff, 0xd8, ...app1, ...sof]))).toEqual({ width: 640, height: 480 });
+  });
+
   it("reads WebP VP8X sizes", () => {
     const bytes = new Uint8Array(30);
     bytes.set([...Buffer.from("RIFF"), 0, 0, 0, 0, ...Buffer.from("WEBPVP8X")]);

@@ -230,7 +230,7 @@ function jpegSize(bytes: Uint8Array): { width: number; height: number } | null {
       return orientation >= 5 && orientation <= 8 ? { width: height, height: width } : { width, height };
     }
     if (marker === 0xe1) {
-      orientation = exifOrientation(bytes, offset + 4, length - 2) ?? orientation;
+      orientation = exifOrientation(bytes.subarray(offset + 4, offset + 2 + length)) ?? orientation;
     }
     offset += 2 + length;
   }
@@ -241,24 +241,30 @@ function isStartOfFrame(marker: number): boolean {
   return marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
 }
 
-function exifOrientation(bytes: Uint8Array, start: number, length: number): number | null {
-  if (length < 14 || ascii(bytes, start, 6) !== "Exif\0\0") {
-    return null;
-  }
-  const tiff = start + 6;
-  const order = ascii(bytes, tiff, 2);
-  if (order !== "II" && order !== "MM") {
-    return null;
-  }
-  const little = order === "II";
-  const data = view(bytes);
-  const ifd = tiff + data.getUint32(tiff + 4, little);
-  const entries = data.getUint16(ifd, little);
-  for (let index = 0; index < entries; index += 1) {
-    const entry = ifd + 2 + index * 12;
-    if (data.getUint16(entry, little) === 0x0112) {
-      return data.getUint16(entry + 8, little);
+// Reads the IFD0 Orientation tag of an APP1 segment payload. Anything malformed
+// yields null, so a broken EXIF block never hides the frame size.
+function exifOrientation(segment: Uint8Array): number | null {
+  try {
+    if (segment.length < 14 || ascii(segment, 0, 6) !== "Exif\0\0") {
+      return null;
     }
+    const tiff = 6;
+    const order = ascii(segment, tiff, 2);
+    if (order !== "II" && order !== "MM") {
+      return null;
+    }
+    const little = order === "II";
+    const data = view(segment);
+    const ifd = tiff + data.getUint32(tiff + 4, little);
+    const entries = data.getUint16(ifd, little);
+    for (let index = 0; index < entries; index += 1) {
+      const entry = ifd + 2 + index * 12;
+      if (data.getUint16(entry, little) === 0x0112) {
+        return data.getUint16(entry + 8, little);
+      }
+    }
+    return null;
+  } catch {
+    return null;
   }
-  return null;
 }

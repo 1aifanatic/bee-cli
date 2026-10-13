@@ -245,7 +245,7 @@ const SEND_PROPERTIES: JsonObject = {
   file_paths: {
     type: "array",
     items: { type: "string" },
-    description: "Local paths of photos or files to attach (max 20, 25 MB each). Content type comes from the extension.",
+    description: "Absolute local paths of photos or files to attach (max 20, 25 MB each); relative paths resolve against the Bee MCP server's working directory. Content type comes from the extension.",
   },
   inline_files: {
     type: "array",
