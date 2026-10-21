@@ -68,6 +68,8 @@ function changesResponse(
     facts: number[];
     todos: number[];
     journals: string[];
+    // Omitted unless set, matching servers that predate insight tracking.
+    insights: number[];
     since: number;
     until: number;
     updated: boolean;
@@ -75,6 +77,7 @@ function changesResponse(
   }> = {}
 ): Response {
   return Response.json({
+    ...(overrides.insights ? { insights: overrides.insights } : {}),
     facts: overrides.facts ?? [],
     todos: overrides.todos ?? [],
     dailies: overrides.dailies ?? [],
@@ -124,6 +127,18 @@ function conversationDetailShape(id: number, startTime = 1_700_000_000_000) {
   };
 }
 
+function insightShape(id: number, generatedAt = 1_700_000_000_000) {
+  return {
+    id,
+    title: `insight ${id}`,
+    description: `description ${id}`,
+    suggested_actions: [`action ${id}`],
+    generated_at: generatedAt,
+    timezone: "UTC",
+    corrections: [],
+  };
+}
+
 function emptyListResponse(key: string): Response {
   return Response.json({ [key]: [], next_cursor: null });
 }
@@ -157,11 +172,13 @@ function baseManifest(overrides: Record<string, unknown> = {}): Record<string, u
 function fullCrawlHandler(opts: {
   dailyIds?: number[];
   convIds?: number[];
+  insightIds?: number[];
   changesUntil?: number;
   onRequest?: (request: Request) => void;
 }): (request: Request) => Response | Promise<Response> {
   const dailyIds = opts.dailyIds ?? [];
   const convIds = opts.convIds ?? [];
+  const insightIds = opts.insightIds ?? [];
   return async (request) => {
     opts.onRequest?.(request);
     const url = new URL(request.url);
@@ -204,6 +221,16 @@ function fullCrawlHandler(opts: {
         })),
         next_cursor: null,
       });
+    }
+    if (p === "/v1/insights") {
+      return Response.json({
+        insights: insightIds.map((id) => insightShape(id)),
+        next_cursor: null,
+      });
+    }
+    if (p.startsWith("/v1/insights/")) {
+      const id = Number(p.slice("/v1/insights/".length));
+      return Response.json(insightShape(id));
     }
     if (p.startsWith("/v1/daily/")) {
       const id = Number(p.slice("/v1/daily/".length));
@@ -278,7 +305,7 @@ describe("sync unit helpers", () => {
       env: "prod",
       account: "proxy",
       cursors: { daily: "v1-5" },
-      pending: { daily: [], conversations: [] },
+      pending: { daily: [], conversations: [], insights: [] },
       lastFullSyncAtMs: 0,
       lastSyncAtMs: 0,
     });
@@ -955,5 +982,134 @@ describe("sync regression", () => {
 
     await syncCommand.run(["--output", outputDir, "--only", "facts"], context);
     expect(process.exitCode).toBe(1);
+  });
+});
+
+describe("sync insights", () => {
+  it("--only insights and all include the insights target", () => {
+    expect([...__testing.parseSyncArgs(["--only", "insights"]).targets]).toEqual(["insights"]);
+    expect(__testing.parseSyncArgs(["--only", "all"]).targets.has("insights")).toBe(true);
+    expect(__testing.parseSyncArgs([]).targets.has("insights")).toBe(true);
+  });
+
+  it("first run writes one file per insight and seeds the insights cursor", async () => {
+    const outputDir = await makeTempDir();
+    const { context } = proxyContext(
+      fullCrawlHandler({ insightIds: [7, 8], changesUntil: 5_000_000 })
+    );
+
+    await syncCommand.run(["--output", outputDir, "--only", "insights"], context);
+
+    const file = path.join(outputDir, "insights", "2023-11-14", "7.md");
+    expect(readFileSync(file, "utf8")).toBe(
+      [
+        "# Insight 7 — insight 7",
+        "",
+        "- id: 7",
+        "- generated_at: 2023-11-14T22:13:20.000Z",
+        "",
+        "## Description",
+        "",
+        "description 7",
+        "",
+        "## Suggested Actions",
+        "",
+        "- action 7",
+        "",
+      ].join("\n")
+    );
+    expect(existsSync(path.join(outputDir, "insights", "2023-11-14", "8.md"))).toBe(true);
+    const cursors = readManifest(outputDir)["cursors"] as { insights?: string };
+    expect(cursors.insights).toBe(`v1-${5_000_000 - 600000}`);
+    expect(process.exitCode).toBe(0);
+  });
+
+  it("incremental run fetches only changed insights and advances the cursor", async () => {
+    const outputDir = await makeTempDir();
+    const cursor = `v1-${Date.now() - 60_000}`;
+    writeManifest(outputDir, baseManifest({ cursors: { insights: cursor } }));
+    const until = Date.now();
+
+    const { context, requests } = proxyContext(async (request) => {
+      const p = new URL(request.url).pathname;
+      if (p === "/v1/changes") return changesResponse({ insights: [42], until });
+      if (p === "/v1/insights/42") return Response.json(insightShape(42, 1_500_000_000_000));
+      return Response.json({});
+    });
+
+    await syncCommand.run(["--output", outputDir, "--only", "insights"], context);
+
+    expect(existsSync(path.join(outputDir, "insights", "2017-07-14", "42.md"))).toBe(true);
+    expect(requests.some((r) => r.pathname === "/v1/insights")).toBe(false);
+    const cursors = readManifest(outputDir)["cursors"] as { insights?: string };
+    expect(cursors.insights).toBe(`v1-${until - 600000}`);
+  });
+
+  it("falls back to a full insight crawl when the server does not report insights", async () => {
+    const outputDir = await makeTempDir();
+    const cursor = `v1-${Date.now() - 60_000}`;
+    writeManifest(outputDir, baseManifest({ cursors: { insights: cursor } }));
+
+    const { context, requests } = proxyContext(
+      fullCrawlHandler({ insightIds: [5], changesUntil: Date.now() })
+    );
+
+    await syncCommand.run(
+      ["--output", outputDir, "--only", "insights", "--recent-days", "3"],
+      context
+    );
+
+    expect(existsSync(path.join(outputDir, "insights", "2023-11-14", "5.md"))).toBe(true);
+    const listReqs = requests.filter((r) => r.pathname === "/v1/insights");
+    expect(listReqs.length).toBe(1);
+    // Fallback crawls are unbounded so older insights are not skipped.
+    expect(listReqs[0]?.search.includes("from=")).toBe(false);
+    expect(process.exitCode).toBe(0);
+  });
+
+  it("skips a deleted insight but keeps other failures pending", async () => {
+    const outputDir = await makeTempDir();
+    const cursor = `v1-${Date.now() - 60_000}`;
+    writeManifest(outputDir, baseManifest({ cursors: { insights: cursor } }));
+
+    const { context } = proxyContext(async (request) => {
+      const p = new URL(request.url).pathname;
+      if (p === "/v1/changes") return changesResponse({ insights: [1, 2, 3], until: Date.now() });
+      if (p === "/v1/insights/1") return Response.json(insightShape(1));
+      if (p === "/v1/insights/2") {
+        return Response.json({ message: "Insight not found." }, { status: 404 });
+      }
+      return Response.json({ error: "boom" }, { status: 500 });
+    });
+
+    await syncCommand.run(["--output", outputDir, "--only", "insights"], context);
+
+    const manifest = readManifest(outputDir);
+    expect((manifest["cursors"] as { insights?: string }).insights).toBe(cursor);
+    expect((manifest["pending"] as { insights?: number[] }).insights).toEqual([3]);
+  });
+
+  it("writes byte-identical insight files in full and incremental modes", async () => {
+    const fullDir = await makeTempDir();
+    await syncCommand.run(
+      ["--output", fullDir, "--only", "insights"],
+      proxyContext(fullCrawlHandler({ insightIds: [9] })).context
+    );
+
+    const incDir = await makeTempDir();
+    writeManifest(incDir, baseManifest({ cursors: { insights: `v1-${Date.now() - 60_000}` } }));
+    await syncCommand.run(
+      ["--output", incDir, "--only", "insights"],
+      proxyContext(async (request) => {
+        const p = new URL(request.url).pathname;
+        if (p === "/v1/changes") return changesResponse({ insights: [9], until: Date.now() });
+        return Response.json(insightShape(9));
+      }).context
+    );
+
+    const relative = path.join("insights", "2023-11-14", "9.md");
+    expect(readFileSync(path.join(incDir, relative), "utf8")).toBe(
+      readFileSync(path.join(fullDir, relative), "utf8")
+    );
   });
 });
