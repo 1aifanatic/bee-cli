@@ -192,7 +192,7 @@ By default, data commands return markdown. Use `--json` to print raw JSON.
 
 - `mcp` - Run or connect the MCP server (see [Use Bee with AI assistants](#use-bee-with-ai-assistants-mcp)). Subcommands: `serve`, `serve-http [--port N] [--token VALUE]`, `connect|disconnect <claude|claude-code|codex>`, `status`.
 
-- `sync` - Export your Bee data to markdown files for AI agents. Re-runs are incremental by default (only changed daily summaries/conversations are re-fetched). Options: `--output <dir>`, `--recent-days N`, `--only <facts|todos|daily|conversations>`, `--full`, `--since <epochMs>`.
+- `sync` - Export your Bee data to markdown files for AI agents. Re-runs are incremental by default (only changed daily summaries, conversations, and insights are re-fetched). Options: `--output <dir>`, `--recent-days N`, `--only <facts|todos|daily|conversations|insights>`, `--full`, `--since <epochMs>`.
 
 - `proxy` - Start a local Bee API proxy. Options: `--port N`, `--socket [path]`, `--idle-timeout SECONDS`.
 
@@ -429,12 +429,12 @@ The `sync` command exports all your Bee data to a local directory as markdown fi
 ### Usage
 
 ```bash
-bee sync [--output <dir>] [--recent-days N] [--only <facts|todos|daily|conversations>] [--full] [--since <epochMs>]
+bee sync [--output <dir>] [--recent-days N] [--only <facts|todos|daily|conversations|insights>] [--full] [--since <epochMs>]
 ```
 
 After a first sync, re-running `bee sync` on the same output directory is
-**incremental**: it re-fetches only the daily summaries and conversations that
-have changed since the last run (facts and todos are always re-fetched in full,
+**incremental**: it re-fetches only the daily summaries, conversations, and
+insights that have changed since the last run (facts and todos are always re-fetched in full,
 since they are small). Sync state is tracked in a `.bee-sync.json` manifest
 inside the output directory; delete it (or the directory) to force a full
 re-sync.
@@ -444,8 +444,8 @@ re-sync.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--output <dir>` | `bee-sync` | Output directory for synced files |
-| `--recent-days N` | all | Limit daily summaries and conversations to the last N days (facts and todos are always synced in full). Applies to full syncs only; ignored on an incremental run |
-| `--only <targets>` | all | Limit sync to a comma-separated list: `facts`, `todos`, `daily`, `conversations` (or `all`) |
+| `--recent-days N` | all | Limit daily summaries, conversations, and insights to the last N days (facts and todos are always synced in full). Applies to full syncs only; ignored on an incremental run |
+| `--only <targets>` | all | Limit sync to a comma-separated list: `facts`, `todos`, `daily`, `conversations`, `insights` (or `all`) |
 | `--full` | off | Force a complete re-sync, ignoring the saved manifest, and rewrite it with fresh cursors |
 | `--since <epochMs>` | — | Advanced/recovery: override the saved incremental cursor with an explicit epoch-milliseconds timestamp for changefeed-driven targets |
 
@@ -458,11 +458,14 @@ bee-sync/
 ├── daily/
 │   └── YYYY-MM-DD/       # One folder per day
 │       └── summary.md    # Daily summary
-└── conversations/
-    └── YYYY-MM-DD/       # One folder per day
-        ├── 123.md        # Individual conversation files
-        ├── 456.md
-        └── ...
+├── conversations/
+│   └── YYYY-MM-DD/       # One folder per day
+│       ├── 123.md        # Individual conversation files
+│       ├── 456.md
+│       └── ...
+└── insights/
+    └── YYYY-MM-DD/       # One folder per day the insight was generated
+        └── 789.md        # Individual insight files
 ```
 
 ### File Formats
@@ -599,6 +602,28 @@ Each conversation file includes:
 - Suggested links extracted from the conversation
 - Full transcription with speaker labels
 
+#### insights/YYYY-MM-DD/ID.md
+
+Individual insights Bee generated about you.
+
+```markdown
+# Insight 789 — Morning focus blocks
+
+- id: 789
+- generated_at: 2024-01-15T16:00:00.000Z
+
+## Description
+
+You do your deepest work before 11am on days without early meetings.
+
+## Suggested Actions
+
+- Block 9-11am for focused work on Tuesdays and Thursdays.
+```
+
+Insights you dismissed or marked inaccurate in the app are not synced. A
+`## Corrections` section is added when an insight has corrections.
+
 ### Examples
 
 Sync to the default directory:
@@ -628,7 +653,7 @@ bee sync --recent-days 7
 ### Notes
 
 - The first sync (or `--full`) fetches everything; facts and todos are always re-fetched in full
-- Re-runs are incremental: only daily summaries and conversations that changed since the last run are re-fetched, tracked via the `.bee-sync.json` manifest in the output directory
+- Re-runs are incremental: only daily summaries, conversations, and insights that changed since the last run are re-fetched, tracked via the `.bee-sync.json` manifest in the output directory
 - Conversations and daily summaries are fetched concurrently for faster syncing
 - All timestamps are in ISO 8601 format (UTC)
 - The output directory is created if it doesn't exist

@@ -8,7 +8,7 @@ import type { Environment } from "@/environment";
 import { loadToken } from "@/secureStore";
 
 const USAGE =
-  "bee sync [--output <dir>] [--recent-days N] [--full] [--since <epochMs>] [--only <facts|todos|daily|conversations>]";
+  "bee sync [--output <dir>] [--recent-days N] [--full] [--since <epochMs>] [--only <facts|todos|daily|conversations|insights>]";
 
 const DEFAULT_OUTPUT_DIR = "bee-sync";
 const PAGE_SIZE = 100;
@@ -26,12 +26,15 @@ const MANIFEST_FILENAME = ".bee-sync.json";
 // trailing window is re-scanned every run, defeating the commit-after-snapshot
 // race and cross-service clock skew. Over-scan is idempotent.
 const CHANGES_OVERLAP_MS = 600000; // 10 minutes
+// Server message for GET /v1/insights/:id on a deleted or foreign id.
+const INSIGHT_NOT_FOUND_MESSAGE = "Insight not found.";
 // Cursors older than this take the full path before the server's 7-day floor can
 // reject them with cursor_too_old.
 const PROACTIVE_FULL_MS = 6 * 24 * 60 * 60 * 1000; // 6 days
 
 // Changefeed-driven targets carry a per-target cursor; facts/todos always full-refetch.
-type ChangefeedTarget = "daily" | "conversations";
+type ChangefeedTarget = "daily" | "conversations" | "insights";
+const CHANGEFEED_TARGETS = ["daily", "conversations", "insights"] as const;
 
 type SyncManifest = {
   schemaVersion: typeof MANIFEST_VERSION;
@@ -40,10 +43,12 @@ type SyncManifest = {
   cursors: {
     daily?: string;
     conversations?: string;
+    insights?: string;
   };
   pending: {
     daily: number[];
     conversations: number[];
+    insights: number[];
   };
   lastFullSyncAtMs: number;
   lastSyncAtMs: number;
@@ -55,6 +60,8 @@ type ChangesResult = {
   facts: number[];
   todos: number[];
   journals: string[];
+  // null when the server predates insight change tracking.
+  insights: number[] | null;
   since: number;
   until: number;
   updated: boolean;
@@ -151,6 +158,16 @@ type ConversationDetail = {
   } | null;
 };
 
+type Insight = {
+  id: number;
+  title: string | null;
+  description: string | null;
+  suggested_actions: string[];
+  generated_at: number;
+  timezone?: string | null;
+  corrections?: Array<{ feedback: string }>;
+};
+
 type ConversationSummary = {
   id: number;
   start_time: number;
@@ -158,7 +175,8 @@ type ConversationSummary = {
   timezone?: string | null;
 };
 
-type SyncTarget = "facts" | "todos" | "daily" | "conversations";
+type SyncTarget = "facts" | "todos" | "daily" | "conversations" | "insights";
+const ALL_SYNC_TARGETS: SyncTarget[] = ["facts", "todos", "daily", "conversations", "insights"];
 
 type SyncOptions = {
   outputDir: string;
@@ -422,7 +440,7 @@ function parseTargets(value: string): SyncTarget[] {
   }
 
   if (parts.includes("all")) {
-    return ["facts", "todos", "daily", "conversations"];
+    return [...ALL_SYNC_TARGETS];
   }
 
   const targets: SyncTarget[] = [];
@@ -439,7 +457,7 @@ function parseTargets(value: string): SyncTarget[] {
 
 function resolveTargets(onlyTargets: SyncTarget[]): Set<SyncTarget> {
   if (onlyTargets.length === 0) {
-    return new Set<SyncTarget>(["facts", "todos", "daily", "conversations"]);
+    return new Set<SyncTarget>(ALL_SYNC_TARGETS);
   }
   return new Set<SyncTarget>(onlyTargets);
 }
@@ -449,7 +467,8 @@ function isSyncTarget(value: string): value is SyncTarget {
     value === "facts" ||
     value === "todos" ||
     value === "daily" ||
-    value === "conversations"
+    value === "conversations" ||
+    value === "insights"
   );
 }
 
@@ -549,24 +568,25 @@ function normalizeCursors(value: unknown): SyncManifest["cursors"] {
   if (!value || typeof value !== "object") {
     return cursors;
   }
-  const record = value as { daily?: unknown; conversations?: unknown };
-  if (isUsableCursor(record.daily)) {
-    cursors.daily = record.daily;
-  }
-  if (isUsableCursor(record.conversations)) {
-    cursors.conversations = record.conversations;
+  const record = value as Record<ChangefeedTarget, unknown>;
+  for (const target of CHANGEFEED_TARGETS) {
+    const cursor = record[target];
+    if (isUsableCursor(cursor)) {
+      cursors[target] = cursor;
+    }
   }
   return cursors;
 }
 
 function normalizePending(value: unknown): SyncManifest["pending"] {
-  const pending: SyncManifest["pending"] = { daily: [], conversations: [] };
+  const pending: SyncManifest["pending"] = { daily: [], conversations: [], insights: [] };
   if (!value || typeof value !== "object") {
     return pending;
   }
-  const record = value as { daily?: unknown; conversations?: unknown };
-  pending.daily = toIdArray(record.daily);
-  pending.conversations = toIdArray(record.conversations);
+  const record = value as Record<ChangefeedTarget, unknown>;
+  for (const target of CHANGEFEED_TARGETS) {
+    pending[target] = toIdArray(record[target]);
+  }
   return pending;
 }
 
@@ -630,6 +650,7 @@ function parseChangesResult(payload: unknown): ChangesResult {
     dailies?: number[];
     journals?: string[];
     todos?: number[];
+    insights?: number[];
     since?: number;
     until?: number;
     updated?: boolean;
@@ -652,6 +673,7 @@ function parseChangesResult(payload: unknown): ChangesResult {
     dailies: data.dailies,
     journals: data.journals,
     todos: data.todos,
+    insights: Array.isArray(data.insights) ? data.insights : null,
     since: typeof data.since === "number" ? data.since : Date.now(),
     until: typeof data.until === "number" ? data.until : Date.now(),
     updated: data.updated === true,
@@ -746,6 +768,25 @@ async function syncAll(
         incremental: (outputDir, t, ids) => syncDailyByIds(context, outputDir, t, ids),
       }).then((outcome) => {
         outcomes.daily = outcome;
+      })
+    );
+  }
+
+  if (options.targets.has("insights")) {
+    const task = progress.addTask("insights");
+    syncPromises.push(
+      syncChangefeedTarget({
+        context,
+        options,
+        manifest,
+        target: "insights",
+        task,
+        userFullFrom,
+        ensureSeed,
+        full: (outputDir, t, from) => syncInsights(context, outputDir, t, from),
+        incremental: (outputDir, t, ids) => syncInsightsByIds(context, outputDir, t, ids),
+      }).then((outcome) => {
+        outcomes.insights = outcome;
       })
     );
   }
@@ -858,10 +899,12 @@ async function syncChangefeedTarget(
       throw error;
     }
 
-    const changedIds = uniqueIds(
-      target === "daily" ? changes.dailies : changes.conversations,
-      pendingIds
-    );
+    const changedForTarget = changedIdsForTarget(changes, target);
+    if (changedForTarget === null) {
+      // Older servers do not report insight changes, so re-list them in full.
+      return runFullTarget(params, /* unbounded */ true, pendingIds);
+    }
+    const changedIds = uniqueIds(changedForTarget, pendingIds);
     const failed = await params.incremental(options.outputDir, task, changedIds);
     if (failed.length === 0) {
       return {
@@ -877,6 +920,20 @@ async function syncChangefeedTarget(
   // FULL path. A user-requested full honors --recent-days; a fallback-triggered
   // full (proactive staleness) is unbounded so gap-edits to old items are caught.
   return runFullTarget(params, /* unbounded */ !userRequestedFull, pendingIds);
+}
+
+function changedIdsForTarget(
+  changes: ChangesResult,
+  target: ChangefeedTarget
+): number[] | null {
+  switch (target) {
+    case "daily":
+      return changes.dailies;
+    case "conversations":
+      return changes.conversations;
+    case "insights":
+      return changes.insights;
+  }
 }
 
 async function runFullTarget(
@@ -923,11 +980,12 @@ async function persistManifest(
   const pending: SyncManifest["pending"] = {
     daily: prior?.pending.daily ?? [],
     conversations: prior?.pending.conversations ?? [],
+    insights: prior?.pending.insights ?? [],
   };
   let lastFullSyncAtMs = prior?.lastFullSyncAtMs ?? 0;
   const now = Date.now();
 
-  for (const target of ["daily", "conversations"] as const) {
+  for (const target of CHANGEFEED_TARGETS) {
     const outcome = outcomes[target];
     if (!outcome) {
       continue; // target not run this pass; preserve prior cursor/pending
@@ -1234,6 +1292,100 @@ async function syncConversationsByIds(
   return reportConversationFailures(task, failures);
 }
 
+async function writeInsightFile(
+  insightsDir: string,
+  insight: Insight
+): Promise<{ id: number; error: string } | null> {
+  try {
+    const dayDir = path.join(insightsDir, resolveInsightFolderName(insight));
+    await mkdir(dayDir, { recursive: true });
+    await writeFile(
+      path.join(dayDir, `${insight.id}.md`),
+      formatInsightMarkdown(insight),
+      "utf8"
+    );
+    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { id: insight.id, error: message };
+  }
+}
+
+function reportInsightFailures(
+  task: ProgressTask,
+  failures: Array<{ id: number; error: string }>
+): number[] {
+  if (failures.length > 0) {
+    task.setLabel(`insights done (${failures.length} failed)`);
+    process.stderr.write(`Warning: ${failures.length} insight(s) failed to sync:\n`);
+    for (const failure of failures.slice(0, 10)) {
+      process.stderr.write(`  - insight ${failure.id}: ${failure.error}\n`);
+    }
+    if (failures.length > 10) {
+      process.stderr.write(`  ... and ${failures.length - 10} more\n`);
+    }
+  } else {
+    task.setLabel("insights done");
+  }
+  task.complete();
+  return failures.map((failure) => failure.id);
+}
+
+// FULL list-mode insight sync. The list payload is complete, so no per-id
+// hydration is needed. Returns the ids that failed to write.
+async function syncInsights(
+  context: CommandContext,
+  outputDir: string,
+  task: ProgressTask,
+  from?: string
+): Promise<number[]> {
+  const insights = await fetchAllInsights(context, task, from);
+  const insightsDir = path.join(outputDir, "insights");
+  await mkdir(insightsDir, { recursive: true });
+
+  const failures: Array<{ id: number; error: string }> = [];
+  await runWithConcurrency(insights, SYNC_CONCURRENCY, async (insight) => {
+    const failure = await writeInsightFile(insightsDir, insight);
+    if (failure) {
+      failures.push(failure);
+    }
+  });
+
+  return reportInsightFailures(task, failures);
+}
+
+// INCREMENTAL id-mode insight sync. An insight deleted after it was reported
+// as changed is skipped rather than retried forever.
+async function syncInsightsByIds(
+  context: CommandContext,
+  outputDir: string,
+  task: ProgressTask,
+  ids: readonly number[]
+): Promise<number[]> {
+  const insightsDir = path.join(outputDir, "insights");
+  await mkdir(insightsDir, { recursive: true });
+  task.setTotal(ids.length);
+
+  const failures: Array<{ id: number; error: string }> = [];
+  await runWithConcurrency(ids, SYNC_CONCURRENCY, async (id) => {
+    try {
+      const insight = await fetchInsight(context, id);
+      const failure = await writeInsightFile(insightsDir, insight);
+      if (failure) {
+        failures.push(failure);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message !== INSIGHT_NOT_FOUND_MESSAGE) {
+        failures.push({ id, error: message });
+      }
+    }
+    task.advance(1);
+  });
+
+  return reportInsightFailures(task, failures);
+}
+
 function dailySortKey(summary: DailySummary): number {
   if (summary.date_time !== null) {
     return summary.date_time;
@@ -1374,6 +1526,47 @@ async function fetchAllConversations(
   return items;
 }
 
+async function fetchAllInsights(
+  context: CommandContext,
+  task: ProgressTask,
+  from?: string
+): Promise<Insight[]> {
+  const items: Insight[] = [];
+  let cursor: string | undefined;
+  task.addTotal(1);
+
+  while (true) {
+    const params = new URLSearchParams();
+    params.set("limit", String(PAGE_SIZE));
+    if (from) {
+      params.set("from", from);
+    }
+    if (cursor) {
+      params.set("cursor", cursor);
+    }
+    const data = await requestClientJson(context, `/v1/insights?${params}`, {
+      method: "GET",
+    });
+    const payload = parseInsightList(data);
+    items.push(...payload.insights);
+    task.advance(payload.insights.length);
+    if (!payload.next_cursor) {
+      break;
+    }
+    task.addTotal(1);
+    cursor = payload.next_cursor;
+  }
+
+  return items;
+}
+
+async function fetchInsight(context: CommandContext, id: number): Promise<Insight> {
+  const data = await requestClientJson(context, `/v1/insights/${id}`, {
+    method: "GET",
+  });
+  return parseInsightDetail(data);
+}
+
 async function fetchDailySummary(
   context: CommandContext,
   dailyId: number
@@ -1417,6 +1610,43 @@ function resolveConversationFolderName(conversation: ConversationDetail): string
   const timestamp = conversation.start_time ?? conversation.created_at ?? 0;
   const timeZone = resolveTimezone(conversation.timezone);
   return formatDateInTimeZone(timestamp, timeZone);
+}
+
+function resolveInsightFolderName(insight: Insight): string {
+  return formatDateInTimeZone(insight.generated_at, resolveTimezone(insight.timezone));
+}
+
+function formatInsightMarkdown(insight: Insight): string {
+  const lines: string[] = [];
+  const title = insight.title?.trim();
+  lines.push(title ? `# Insight ${insight.id} — ${title}` : `# Insight ${insight.id}`, "");
+  lines.push(`- id: ${insight.id}`);
+  lines.push(`- generated_at: ${formatDateTime(insight.generated_at)}`);
+  lines.push("");
+
+  lines.push("## Description", "");
+  lines.push(insight.description?.trim() || "(empty)", "");
+
+  lines.push("## Suggested Actions", "");
+  if (insight.suggested_actions.length > 0) {
+    for (const action of insight.suggested_actions) {
+      lines.push(`- ${action}`);
+    }
+  } else {
+    lines.push("- (none)");
+  }
+  lines.push("");
+
+  const corrections = insight.corrections ?? [];
+  if (corrections.length > 0) {
+    lines.push("## Corrections", "");
+    for (const correction of corrections) {
+      lines.push(`- ${correction.feedback}`);
+    }
+    lines.push("");
+  }
+
+  return lines.join("\n");
 }
 
 async function writeFactsMarkdown(
@@ -1774,6 +2004,39 @@ function parseConversationBatchResponse(payload: unknown): ConversationDetail[] 
     throw new Error("Invalid batch response.");
   }
   return data.conversations;
+}
+
+function parseInsightList(
+  payload: unknown
+): { insights: Insight[]; next_cursor: string | null } {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Invalid insights response.");
+  }
+  const data = payload as {
+    insights?: Insight[];
+    next_cursor?: string | null;
+  };
+  if (!Array.isArray(data.insights)) {
+    throw new Error("Invalid insights response.");
+  }
+  return {
+    insights: data.insights,
+    next_cursor: data.next_cursor ?? null,
+  };
+}
+
+function parseInsightDetail(payload: unknown): Insight {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Invalid insight response.");
+  }
+  const data = payload as Partial<Insight>;
+  if (typeof data.id !== "number" || typeof data.generated_at !== "number") {
+    throw new Error("Invalid insight response.");
+  }
+  return {
+    ...(data as Insight),
+    suggested_actions: Array.isArray(data.suggested_actions) ? data.suggested_actions : [],
+  };
 }
 
 function chunkArray<T>(items: readonly T[], size: number): T[][] {
