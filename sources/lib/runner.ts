@@ -1,5 +1,7 @@
 import type { BeeCliOptions, RunOptions, SpawnOptions } from "./types.js";
 import { spawn as nodeSpawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 type RunResult = {
   stdout: string;
@@ -32,8 +34,30 @@ export type BeeCliRunner = {
   spawn: (args: string[], options?: SpawnOptions) => BeeSubprocess;
 };
 
+// The npm package ships the native binary next to this module (dist/lib -> dist/platforms).
+// Spawning it directly works without a global install, and on Windows, where spawn() cannot run
+// the `bee.cmd` shim npm puts on PATH. Same lookup as bin/bee.js, including BEE_CLI_BINARY.
+function defaultCommand(): string {
+  const override = process.env["BEE_CLI_BINARY"];
+  if (override) {
+    return override;
+  }
+  const platforms: Record<string, string> = { darwin: "mac", linux: "linux", win32: "windows" };
+  const arches: Record<string, string> = { arm64: "arm64", x64: "x64" };
+  const platform = platforms[process.platform];
+  const arch = arches[process.arch];
+  if (platform && arch) {
+    const binary = platform === "windows" ? "bee.exe" : "bee";
+    const bundled = fileURLToPath(new URL(`../platforms/${platform}-${arch}/${binary}`, import.meta.url));
+    if (existsSync(bundled)) {
+      return bundled;
+    }
+  }
+  return "bee";
+}
+
 export function createBeeCliRunner(options: BeeCliOptions = {}): BeeCliRunner {
-  const command = options.command ?? "bee";
+  const command = options.command ?? defaultCommand();
   const baseArgs = options.baseArgs ?? [];
   const environment = options.environment ?? "prod";
   const cwd = options.cwd;

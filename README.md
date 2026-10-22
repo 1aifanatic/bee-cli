@@ -84,8 +84,9 @@ bee <command> [options]
 ## Library (Node)
 
 You can also import a small library wrapper that shells out to the `bee` binary
-and uses the JSON output flags. This runs in Node.js. Ensure `bee` is on your
-`PATH`, or pass a custom `command` path when creating the client.
+and uses the JSON output flags. This runs in Node.js. By default it spawns the native binary bundled with the
+package (or `BEE_CLI_BINARY`, like the `bee` bin), falling back to `bee` on your
+`PATH`. Pass a custom `command` path when creating the client to override it.
 
 ```ts
 import { createBeeClient } from "@beeai/cli/lib";
